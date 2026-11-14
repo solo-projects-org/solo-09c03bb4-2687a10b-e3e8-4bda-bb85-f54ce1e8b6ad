@@ -3,6 +3,11 @@
 Two replicas of this service run in docker-compose against one shared table
 directory, which is how the "two processes" requirement is demonstrated:
 either process can compact, and the Delta OCC protocol serialises them.
+
+The same replicas serve ``/table/changes``, a resumable row-level change feed
+over ``dataChange=true`` actions so the alert pipeline can catch up on newly
+inserted and retracted observations without ever being re-alerted by a
+compaction.
 """
 
 from __future__ import annotations
@@ -10,11 +15,12 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import delta
+from . import change_feed, delta
 from .sample_data import create_sample_table
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/data"))
@@ -84,6 +90,69 @@ class TableStatsResponse(BaseModel):
     staging_orphans_cleaned: list[str]
 
 
+class ChangeRow(BaseModel):
+    station: str = Field(description="Station identifier as stored in the parquet file.")
+    utc_seconds: int = Field(description="Observation time, UTC seconds since epoch.")
+    level_mm: int = Field(description="Water level in millimetres.")
+
+
+class ChangeRecord(BaseModel):
+    record_id: str = Field(
+        description=(
+            "Stable identity of this row change: "
+            "'v{version}-a{action_index}-r{row_index}'."
+        ),
+    )
+    version: int = Field(description="Log version that contains the dataChange action.")
+    action_index: int = Field(
+        description="0-based position of the add/remove action inside that log file.",
+    )
+    row_index: int = Field(
+        description="0-based position of the row inside the action's parquet file.",
+    )
+    action: Literal["add", "remove"] = Field(description="Raw Delta action name.")
+    change_type: Literal["insert", "delete"] = Field(
+        description="Row-level effect: insert for add, delete for remove.",
+    )
+    path: str = Field(description="Parquet file (relative to the table root).")
+    row: ChangeRow
+
+
+class ChangeFeedResponse(BaseModel):
+    table: str
+    start_version: int = Field(description="First version covered by this round.")
+    end_version: int = Field(
+        description=(
+            "Pinned upper bound of this round (latest version at the first "
+            "request). Commits after this bound belong to the next round."
+        ),
+    )
+    page_size: int
+    records: list[ChangeRecord]
+    count: int = Field(description="Number of records in this page.")
+    has_more: bool = Field(
+        description="True when another page of the same pinned round exists.",
+    )
+    next_cursor: str | None = Field(
+        description=(
+            "Opaque continuation token for the next page; null when the "
+            "pinned round is exhausted. Pass it back as ?cursor=."
+        ),
+    )
+    cursor: str | None = Field(
+        description="Alias of next_cursor.",
+    )
+    next_start_version: int = Field(
+        description=(
+            "Version to pass as start_version for the next round. Always "
+            "end_version + 1; independent of how many pages remain."
+        ),
+    )
+    latest_version: int = Field(
+        description="Latest committed version observed while serving this page.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -100,17 +169,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Delta Lake Compaction API",
+    title="Delta Lake Compaction & Change Feed API",
     description=(
         "Compact small parquet files of the unpartitioned water-level "
         "observation Delta table (reader protocol v1, writer protocol v2, "
-        "no deletion vectors). Compaction commits use add/remove actions "
-        "with dataChange=false and preserve every value, duplicate row, "
-        "the schema and all old snapshots. Optimistic concurrency control "
-        "lets external writers keep committing; the compaction only "
+        "no deletion vectors) and replay its row-level changes. Compaction "
+        "commits use add/remove actions with dataChange=false and preserve "
+        "every value, duplicate row, the schema and all old snapshots, so "
+        "they never appear in the change feed. Optimistic concurrency "
+        "control lets external writers keep committing; the compaction only "
         "replaces its selected files while all of them are still active."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -123,6 +193,7 @@ def _delta_http(exc: delta.DeltaError) -> HTTPException:
         delta.InvalidRequestError: 400,
         delta.ConflictError: 409,
         delta.TableCorruptError: 500,
+        change_feed.DataFileUnavailableError: 500,
     }
     for cls, code in status.items():
         if isinstance(exc, cls):
@@ -194,6 +265,71 @@ def snapshot(version: int | None = None) -> SnapshotResponse:
         active_files=sorted(snap.active),
         row_count=table.num_rows,
     )
+
+
+@app.get(
+    "/table/changes",
+    response_model=ChangeFeedResponse,
+    tags=["change-feed"],
+    summary="Read row-level data changes (resumable)",
+)
+@app.get(
+    "/changes",
+    response_model=ChangeFeedResponse,
+    tags=["change-feed"],
+    include_in_schema=False,
+)
+def changes(
+    start_version: int | None = Query(
+        default=None,
+        ge=0,
+        description=(
+            "First log version of the round. Required on the first request; "
+            "omit it when passing a cursor."
+        ),
+    ),
+    page_size: int | None = Query(
+        default=None,
+        ge=1,
+        le=change_feed.MAX_PAGE_SIZE,
+        description=(
+            f"Maximum records per page (default {change_feed.DEFAULT_PAGE_SIZE}). "
+            "A continuation reuses the value pinned in the cursor unless "
+            "overridden explicitly."
+        ),
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description=(
+            "Opaque continuation token returned as next_cursor. Continues the "
+            "same pinned round on any replica and across restarts."
+        ),
+    ),
+) -> ChangeFeedResponse:
+    """Read inserted/deleted rows from ``dataChange=true`` actions, in log order.
+
+    Compaction commits add/remove parquet files with ``dataChange=false`` and
+    are therefore skipped: merging small files never replays old observations.
+
+    Each record is identified by version, action position and in-file row
+    index. Duplicate rows are preserved. Deletes are produced by reading the
+    removed parquet file, including a compaction output that was deleted
+    later; a missing data file fails the request instead of being skipped.
+
+    The first request pins the current latest version as the round's upper
+    bound. Later pages are served only from the cursor, so new commits during
+    the round wait for the next one (``next_start_version``).
+    """
+    try:
+        result = change_feed.read_change_page(
+            TABLE_DIR,
+            start_version=start_version,
+            page_size=page_size,
+            cursor=cursor,
+        )
+    except delta.DeltaError as exc:
+        raise _delta_http(exc)
+    return ChangeFeedResponse(table=TABLE_NAME, **result)
 
 
 @app.get("/table/stats", response_model=TableStatsResponse, tags=["ops"])
